@@ -1,5 +1,4 @@
 #cloud-config
-# по этой строке cloud-init понимает, что перед ним конфигурация, а не текст
 
 users:
   - name: student                       # логин, под которым будете заходить по SSH
@@ -15,6 +14,14 @@ packages:
   - nginx                               # ставится при первой загрузке машины
 
 runcmd:
+  # разметка и монтирование диска
+  - |
+    if [ -b /dev/disk/by-id/virtio-data ]; then
+      blkid /dev/disk/by-id/virtio-data || mkfs.ext4 -q /dev/disk/by-id/virtio-data
+      mkdir -p /mnt/data
+      grep -q virtio-data /etc/fstab || echo "/dev/disk/by-id/virtio-data /mnt/data ext4 defaults,nofail 0 2" >> /etc/fstab
+      mount -a
+    fi
   # меняем порт в конфигурации nginx: сначала IPv4, потом IPv6
   - sed -i 's/listen 80 default_server;/listen ${APP_PORT} default_server;/' /etc/nginx/sites-available/default
   - sed -i 's/listen \[::\]:80 default_server;/listen [::]:${APP_PORT} default_server;/' /etc/nginx/sites-available/default
