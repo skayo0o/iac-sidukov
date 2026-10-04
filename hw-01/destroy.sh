@@ -9,10 +9,12 @@ if [[ "${1:-}" == "--prefix" ]]; then
   PREFIX="$2"
 fi
 
-# имена ресурсов с "$PREFIX-"
+echo "==> удаляем ресурсы с меткой owner=$PREFIX"
+
+# имена ресурсов с меткой owner=$PREFIX
 mine() {
   "$@" --format json \
-    | jq -r --arg p "$PREFIX-" '.[] | select((.name // "") | startswith($p)) | .name'
+    | jq -r --arg p "$PREFIX" '.[] | select(.labels.owner == $p) | .name'
 }
 
 # сначала что ссылается на другие ресурсы
@@ -26,15 +28,10 @@ for n in $(mine yc load-balancer target-group list); do
   yc load-balancer target-group delete --name "$n"
 done
 
+# загрузочные диски удаляются вместе с машинами
 echo "==> машины"
 for n in $(mine yc compute instance list); do
   yc compute instance delete --name "$n"
-done
-
-# загрузочные диски удаляются вместе с машинами, но проверяем отдельно
-echo "==> диски"
-for n in $(mine yc compute disk list); do
-  yc compute disk delete --name "$n"
 done
 
 # подсеть ссылается на таблицу
@@ -77,5 +74,11 @@ echo "==> адреса"
 for n in $(mine yc vpc address list); do
   yc vpc address delete --name "$n"
 done
+
+# загрузочный диск создаётся вместе с машиной и меток не получает,
+# поэтому по метке его не найти; показываем диски, не подключённые ни к одной машине
+echo "==> диски без машины (проверьте вручную)"
+yc compute disk list --format json \
+  | jq -r '.[] | select((.instance_ids // []) | length == 0) | "  \(.name // "") \(.id)"'
 
 echo "==> уборка завершена"

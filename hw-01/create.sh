@@ -2,10 +2,11 @@
 set -euo pipefail
 
 # переменные из варианта
-PREFIX=sidukov-08
-ZONE_A=ru-central1-b
-ZONE_B=ru-central1-d
-CIDR_A=10.18.1.0/24
+PREFIX="${PREFIX:-sidukov-08}"
+ENV_NAME="${ENV_NAME:-stage}"
+ZONE_A="${ZONE_A:-ru-central1-b}"
+ZONE_B="${ZONE_B:-ru-central1-d}"
+CIDR_A="${CIDR_A:-10.18.1.0/24}"
 CIDR_B="${CIDR_B:-10.18.2.0/24}"
 APP_PORT="${APP_PORT:-8024}"
 GREETING="${GREETING:-labwork}"
@@ -13,13 +14,14 @@ WEB_COUNT="${WEB_COUNT:-3}"
 IMAGE_FAMILY=ubuntu-2404-lts
 
 # запуск из любой директории
-cd "$(dirname "$0")" 
+cd "$(dirname "$0")"
 
 # вывод аргументов командной строки
-usage() { echo "Использование: $0 [--prefix P] [--web-count N] [--port N] [--greeting W]"; }
+usage() { echo "Использование: $0 [--prefix P] [--env E] [--web-count N] [--port N] [--greeting W]"; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --prefix)    PREFIX="$2";    shift 2 ;;
+    --env)       ENV_NAME="$2";  shift 2 ;;
     --web-count) WEB_COUNT="$2"; shift 2 ;;
     --port)      APP_PORT="$2";  shift 2 ;;
     --greeting)  GREETING="$2";  shift 2 ;;
@@ -27,39 +29,48 @@ while [[ $# -gt 0 ]]; do
     *) echo "неизвестный аргумент $1" >&2; usage; exit 2 ;;
   esac
 done
-echo "Параметры: PREFIX=$PREFIX WEB_COUNT=$WEB_COUNT APP_PORT=$APP_PORT GREETING=$GREETING"
+
+# метки для всех создаваемых ресурсов
+LABELS="env=$ENV_NAME,owner=$PREFIX"
+
+echo "Параметры: PREFIX=$PREFIX ENV_NAME=$ENV_NAME WEB_COUNT=$WEB_COUNT APP_PORT=$APP_PORT GREETING=$GREETING"
+echo "Метки: $LABELS"
 
 # проверяем ответ команды get
 # проверка стоит прямо перед созданием каждого ресурса
-exists() { 
-  "$@" >/dev/null 2>&1; 
-}   
+exists() {
+  "$@" >/dev/null 2>&1;
+}
 
-skip() { 
-  echo "  $1 уже есть, пропускаю"; 
+skip() {
+  echo "  $1 уже есть, пропускаю";
 }
 
 # сеть и подсети
 echo "==> сеть и подсети"
 if exists yc vpc network get --name "$PREFIX-net"; then skip "$PREFIX-net"
-else yc vpc network create --name "$PREFIX-net"; fi
+else yc vpc network create --name "$PREFIX-net" \
+       --labels "$LABELS"; fi
 
 for s in a b; do
   if [[ $s == a ]]; then Z=$ZONE_A; C=$CIDR_A; else Z=$ZONE_B; C=$CIDR_B; fi
   if exists yc vpc subnet get --name "$PREFIX-subnet-$s"; then skip "$PREFIX-subnet-$s"
-  else yc vpc subnet create --name "$PREFIX-subnet-$s" --network-name "$PREFIX-net" --zone "$Z" --range "$C"; fi
+  else yc vpc subnet create --name "$PREFIX-subnet-$s" --network-name "$PREFIX-net" --zone "$Z" --range "$C" \
+         --labels "$LABELS"; fi
 done
 
 # NAT-шлюз и таблица маршрутизации
-# ОБЯЗАТЕЛЬНО ДО СОЗДАНИЯ 
+# ОБЯЗАТЕЛЬНО ДО СОЗДАНИЯ ВЕБ-СЕРВЕРОВ
 echo "==> NAT-шлюз"
 if exists yc vpc gateway get --name "$PREFIX-nat"; then skip "$PREFIX-nat"
-else yc vpc gateway create --name "$PREFIX-nat"; fi
+else yc vpc gateway create --name "$PREFIX-nat" \
+       --labels "$LABELS"; fi
 GW_ID=$(yc vpc gateway get --name "$PREFIX-nat" --format json | jq -r .id)
 
 if exists yc vpc route-table get --name "$PREFIX-rt"; then skip "$PREFIX-rt"
 else yc vpc route-table create --name "$PREFIX-rt" --network-name "$PREFIX-net" \
-       --route "destination=0.0.0.0/0,gateway-id=$GW_ID"; fi
+       --route "destination=0.0.0.0/0,gateway-id=$GW_ID" \
+       --labels "$LABELS"; fi
 
 RT_ON_SUBNET=$(yc vpc subnet get --name "$PREFIX-subnet-a" --format json | jq -r '.route_table_id // empty')
 if [[ -n "$RT_ON_SUBNET" ]]; then skip "привязка $PREFIX-rt к subnet-a"
@@ -83,7 +94,8 @@ for i in $(seq 1 "$WEB_COUNT"); do
     --cores=2 --core-fraction=20 --memory=2 --preemptible \
     --create-boot-disk image-folder-id=standard-images,image-family="$IMAGE_FAMILY",type=network-hdd,size=20 \
     --network-interface subnet-name="${SUBNETS[$idx]}",nat-ip-version=ipv4 \
-    --metadata-from-file user-data=cloud-init.yaml
+    --metadata-from-file user-data=cloud-init.yaml \
+    --labels "$LABELS"
 done
 
 # сервер приложения
@@ -94,9 +106,10 @@ else yc compute instance create --name "$PREFIX-app" --hostname "$PREFIX-app" \
     --cores=2 --core-fraction=20 --memory=2 --preemptible \
     --create-boot-disk image-folder-id=standard-images,image-family="$IMAGE_FAMILY",type=network-hdd,size=20 \
     --network-interface subnet-name="$PREFIX-subnet-a" \
-    --metadata-from-file user-data=cloud-init.yaml; fi
+    --metadata-from-file user-data=cloud-init.yaml \
+    --labels "$LABELS"; fi
 
-# целевая группа 
+# целевая группа
 echo "==> целевая группа"
 if exists yc load-balancer target-group get --name "$PREFIX-tg"; then skip "$PREFIX-tg"
 else
@@ -106,7 +119,8 @@ else
     IP=$(yc compute instance get --name "$PREFIX-web-$i" --format json | jq -r '.network_interfaces[0].primary_v4_address.address')
     TARGETS+=(--target "subnet-name=${SUBNETS[$idx]},address=$IP")
   done
-  yc load-balancer target-group create --name "$PREFIX-tg" "${TARGETS[@]}"
+  yc load-balancer target-group create --name "$PREFIX-tg" "${TARGETS[@]}" \
+    --labels "$LABELS"
 fi
 
 # балансировщик
@@ -116,7 +130,8 @@ else
   TG_ID=$(yc load-balancer target-group get --name "$PREFIX-tg" --format json | jq -r .id)
   yc load-balancer network-load-balancer create --name "$PREFIX-lb" --region-id ru-central1 \
     --listener name=http,port=80,target-port="$APP_PORT",external-ip-version=ipv4 \
-    --target-group target-group-id="$TG_ID",healthcheck-name=http,healthcheck-interval=2s,healthcheck-timeout=1s,healthcheck-unhealthythreshold=2,healthcheck-healthythreshold=2,healthcheck-http-port="$APP_PORT",healthcheck-http-path=/
+    --target-group target-group-id="$TG_ID",healthcheck-name=http,healthcheck-interval=2s,healthcheck-timeout=1s,healthcheck-unhealthythreshold=2,healthcheck-healthythreshold=2,healthcheck-http-port="$APP_PORT",healthcheck-http-path=/ \
+    --labels "$LABELS"
 fi
 
 LB_IP=$(yc load-balancer network-load-balancer get --name "$PREFIX-lb" --format json | jq -r '.listeners[0].address')
